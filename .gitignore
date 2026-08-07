@@ -195,3 +195,8 @@ references
 debug-output
 debug-outputs
 .github/test-plans/
+
+# Workspace task and Bun caches
+.turbo/
+.bun/
+bun-debug.log*
