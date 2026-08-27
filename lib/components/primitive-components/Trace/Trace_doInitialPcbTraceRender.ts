@@ -5,18 +5,23 @@ import { getFullConnectivityMapFromCircuitJson } from "circuit-json-to-connectiv
 import { TraceConnectionError } from "lib/errors"
 import type { SimplifiedPcbTrace } from "lib/utils/autorouting/SimpleRouteJson"
 import { findPossibleTraceLayerCombinations } from "lib/utils/autorouting/findPossibleTraceLayerCombinations"
+import {
+  type PcbTraceRoutePointWithSrjMetadata,
+  getCircuitJsonPcbTraceRoute,
+} from "lib/utils/autorouting/get-circuit-json-pcb-trace-route"
 import { mergeRoutes } from "lib/utils/autorouting/mergeRoutes"
 import { shouldSkipAutoroutingBecauseOfPlacementErrors } from "lib/utils/autorouting/should-skip-autorouting-because-of-placement-errors"
 import { shouldSkipAutoroutingBecauseOfTraceLengthViolations } from "lib/utils/autorouting/should-skip-autorouting-because-of-trace-length-violations"
 import { getClosest } from "lib/utils/getClosest"
 import {
+  getAutoroutedViaLayers,
   getBoardAvailableLayers,
-  getViaSpanLayers,
 } from "lib/utils/getViaSpanLayers"
 import { getObstaclesFromCircuitJson } from "lib/utils/obstacles/getObstaclesFromCircuitJson"
 import { pairs } from "lib/utils/pairs"
 import { getRoutePointPosition } from "lib/utils/pcb-trace-route-point-utils"
 import { getViaDiameterDefaults } from "lib/utils/pcbStyle/getViaDiameterDefaults"
+import { reversePcbTraceRoute } from "lib/utils/reverse-pcb-trace-route"
 import { tryNow } from "lib/utils/try-now"
 import type { Port } from "../Port"
 import type { TraceHint } from "../TraceHint"
@@ -52,28 +57,6 @@ const getDistanceToRouteObjective = (
   return Math.hypot(position.x - objective.x, position.y - objective.y)
 }
 
-const reverseRouteDirection = (route: PcbTrace["route"]): PcbTrace["route"] =>
-  route
-    .slice()
-    .reverse()
-    .map((point) => {
-      if (point.route_type === "via") {
-        return { ...point }
-      }
-
-      if (point.route_type === "through_pad") {
-        return {
-          ...point,
-          start: point.end,
-          end: point.start,
-          start_layer: point.end_layer,
-          end_layer: point.start_layer,
-        }
-      }
-
-      return { ...point }
-    })
-
 const ensureRouteStartsAtObjective = (
   route: PcbTrace["route"],
   objective: PcbRouteObjective,
@@ -84,7 +67,7 @@ const ensureRouteStartsAtObjective = (
   const lastPoint = route[route.length - 1]
   return getDistanceToRouteObjective(lastPoint, objective) <
     getDistanceToRouteObjective(firstPoint, objective)
-    ? reverseRouteDirection(route)
+    ? reversePcbTraceRoute(route)
     : route
 }
 
@@ -93,6 +76,10 @@ export function Trace_doInitialPcbTraceRender(trace: Trace) {
   const { db } = trace.root!
   const { _parsedProps: props, parent } = trace
   const subcircuit = trace.getSubcircuit()
+  const boardComponent = trace._getBoard()
+  const board = boardComponent?.pcb_board_id
+    ? db.pcb_board.get(boardComponent.pcb_board_id)
+    : undefined
 
   if (!parent) throw new Error("Trace has no parent")
 
@@ -522,7 +509,9 @@ export function Trace_doInitialPcbTraceRender(trace: Trace) {
   const pcbStyle = trace.getInheritedMergedProperty("pcbStyle")
   const { holeDiameter, padDiameter } = getViaDiameterDefaults(pcbStyle)
   const pcb_trace = db.pcb_trace.insert({
-    route: mergedRoute,
+    route: getCircuitJsonPcbTraceRoute(
+      mergedRoute as PcbTraceRoutePointWithSrjMetadata[],
+    ),
     source_trace_id: trace.source_trace_id!,
     subcircuit_id: trace.getSubcircuit()?.subcircuit_id!,
     trace_length: traceLength,
@@ -535,6 +524,9 @@ export function Trace_doInitialPcbTraceRender(trace: Trace) {
 
   for (const point of mergedRoute) {
     if (point.route_type === "via") {
+      const routedViaPoint = point as typeof point & {
+        layers?: LayerRef[]
+      }
       const fromLayer = point.from_layer as LayerRef
       const toLayer = point.to_layer as LayerRef
       db.pcb_via.insert({
@@ -543,10 +535,12 @@ export function Trace_doInitialPcbTraceRender(trace: Trace) {
         y: point.y,
         hole_diameter: holeDiameter,
         outer_diameter: padDiameter,
-        layers: getViaSpanLayers({
+        layers: getAutoroutedViaLayers({
           fromLayer,
           toLayer,
           layerCount: subcircuit._getSubcircuitLayerCount(),
+          allowBlindAndBuriedVias: board?.allow_blind_and_buried_vias ?? false,
+          physicalLayers: routedViaPoint.layers,
         }),
         from_layer: fromLayer,
         to_layer: toLayer,

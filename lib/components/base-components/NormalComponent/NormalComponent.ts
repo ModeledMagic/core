@@ -45,6 +45,7 @@ import {
 import {
   isFootprintFlipped,
   transformFootprintInsertionDirection,
+  transformFootprintInsertionDirectionVector,
 } from "lib/utils/pcb/transform-footprint-insertion-direction"
 import {
   type PortArrangement,
@@ -137,6 +138,7 @@ export class NormalComponent<
   extends PrimitiveComponent<ZodProps>
   implements INormalComponent
 {
+  schematicBoxDimensions: SchematicBoxDimensions | null = null
   reactSubtrees: Array<ReactSubtree> = []
   _impliedFootprint?: string | undefined
   _resolvedPcbCalcOffsetX: number | undefined
@@ -290,6 +292,14 @@ export class NormalComponent<
       ignoreSymbolPorts?: boolean
     } = {},
   ) {
+    // React symbol ports are added during ReactSubtreesRender. Wait for them so
+    // pinLabels and footprint inference can reuse those ports instead of
+    // creating a duplicate set during construction.
+    const hasPendingReactSymbol =
+      isValidElement(this.props.symbol) &&
+      !this.children.some((child) => child.componentName === "Symbol")
+    if (hasPendingReactSymbol) return
+
     this._inferredInternallyConnectedPinNames = []
     const { config } = this
     const portsToCreate: Port[] = []
@@ -662,11 +672,14 @@ export class NormalComponent<
       {},
       {
         get: (target, prop): Port => {
-          const port = this.children.find(
-            (c) =>
-              c.componentName === "Port" &&
-              (c as Port).isMatchingNameOrAlias(prop as string),
+          const symbol = this.children.find(
+            (child) => child.componentName === "Symbol",
           )
+          const port = [...this.children, ...(symbol?.children ?? [])].find(
+            (child) =>
+              child.componentName === "Port" &&
+              (child as Port).isMatchingNameOrAlias(prop as string),
+          ) as Port | undefined
           if (!port) {
             throw new Error(
               `There was an issue finding the port "${prop.toString()}" inside of a ${
@@ -746,6 +759,22 @@ export class NormalComponent<
     }
   }
 
+  updateSourceParentAttachment(): void {
+    const { db } = this.root!
+
+    for (const internalConnection of db.source_component_internal_connection.list(
+      {
+        source_component_id: this.source_component_id!,
+      },
+    )) {
+      db.source_component_internal_connection.delete(
+        internalConnection.source_component_internal_connection_id,
+      )
+    }
+
+    this.doInitialSourceParentAttachment()
+  }
+
   /**
    * Render the schematic component for this NormalComponent using the
    * config.schematicSymbolName if it exists, or create a generic box if
@@ -821,11 +850,13 @@ export class NormalComponent<
     this.schematic_component_id = schematic_component.schematic_component_id
   }
 
-  _doInitialSchematicComponentRenderWithSchematicBoxDimensions() {
+  _doInitialSchematicComponentRenderWithSchematicBoxDimensions(
+    dimensions: SchematicBoxDimensions,
+  ) {
     if (this.root?.schematicDisabled) return
     const { db } = this.root!
     const { _parsedProps: props } = this
-    const dimensions = this._getSchematicBoxDimensions()!
+    this.schematicBoxDimensions = dimensions
 
     const primaryPortLabels: Record<string, string> = {}
     if (Array.isArray(props.pinLabels)) {
@@ -860,9 +891,9 @@ export class NormalComponent<
       source_component_id: this.source_component_id!,
       schematic_sheet_id: this._resolveSchematicSheetId(),
     })
+    const hasTopPins = schPortArrangement?.topSide !== undefined
     const hasTopOrBottomPins =
-      schPortArrangement?.topSide !== undefined ||
-      schPortArrangement?.bottomSide !== undefined
+      hasTopPins || schPortArrangement?.bottomSide !== undefined
     const schematic_box_width = dimensions?.getSize().width
     const schematic_box_height = dimensions?.getSize().height
     const manufacturer_part_number_schematic_text = db.schematic_text.insert({
@@ -871,7 +902,7 @@ export class NormalComponent<
       anchor: "left",
       rotation: 0,
       position: {
-        x: hasTopOrBottomPins
+        x: hasTopPins
           ? center.x + (schematic_box_width ?? 0) / 2 + 0.1
           : center.x - (schematic_box_width ?? 0) / 2,
         y: hasTopOrBottomPins
@@ -888,7 +919,7 @@ export class NormalComponent<
       anchor: "left",
       rotation: 0,
       position: {
-        x: hasTopOrBottomPins
+        x: hasTopPins
           ? center.x + (schematic_box_width ?? 0) / 2 + 0.1
           : center.x - (schematic_box_width ?? 0) / 2,
         y: hasTopOrBottomPins
@@ -1162,6 +1193,7 @@ export class NormalComponent<
   private _getFootprintMetadataForPcbComponent():
     | {
         insertionDirection?: FootprintInsertionDirection
+        cutoutApertureDirection?: FootprintInsertionDirection
         originalLayer?: LayerRef
       }
     | undefined {
@@ -1172,6 +1204,8 @@ export class NormalComponent<
     if (footprintChild) {
       return {
         insertionDirection: footprintChild._parsedProps.insertionDirection,
+        cutoutApertureDirection:
+          footprintChild._parsedProps.cutoutApertureDirection,
         originalLayer: footprintChild._parsedProps.originalLayer,
       }
     }
@@ -1181,10 +1215,12 @@ export class NormalComponent<
     if (isValidElement(footprint)) {
       const footprintProps = footprint.props as {
         insertionDirection?: FootprintInsertionDirection
+        cutoutApertureDirection?: FootprintInsertionDirection
         originalLayer?: LayerRef
       }
       return {
         insertionDirection: footprintProps.insertionDirection,
+        cutoutApertureDirection: footprintProps.cutoutApertureDirection,
         originalLayer: footprintProps.originalLayer,
       }
     }
@@ -1194,6 +1230,9 @@ export class NormalComponent<
         insertionDirection:
           footprint._parsedProps?.insertionDirection ??
           footprint.props?.insertionDirection,
+        cutoutApertureDirection:
+          footprint._parsedProps?.cutoutApertureDirection ??
+          footprint.props?.cutoutApertureDirection,
         originalLayer:
           footprint._parsedProps?.originalLayer ??
           footprint.props?.originalLayer,
@@ -1227,6 +1266,37 @@ export class NormalComponent<
       isFlipped: isFootprintFlipped({
         componentLayer,
         originalLayer: footprintMetadata.originalLayer,
+      }),
+    })
+  }
+
+  /**
+   * The enclosure aperture's outward axis as a continuous unit direction in
+   * board XYZ (+Z above the board). It is a direction, not a point, and receives
+   * the same rotation and layer transform as the footprint's pads.
+   *
+   * The emitted named direction is deliberately quantized because it chooses a
+   * Cartesian wall. A cutting tool must use this unquantized companion instead:
+   * at +45 degrees the chosen wall can still be x_neg while the physical axis
+   * is exactly halfway toward y_neg, and reconstructing that angle from the
+   * component rotation loses which side of the tie core selected.
+   */
+  _getEnclosureApertureAxisDirection(
+    componentLayer: LayerRef,
+    rotationDegrees: number = this.getGlobalTransformRotation(),
+  ): { x: number; y: number; z: number } | undefined {
+    const footprintMetadata = this._getFootprintMetadataForPcbComponent()
+    const apertureDirection =
+      footprintMetadata?.cutoutApertureDirection ??
+      footprintMetadata?.insertionDirection
+    if (!apertureDirection) return undefined
+
+    return transformFootprintInsertionDirectionVector({
+      insertionDirection: apertureDirection,
+      rotationDegrees,
+      isFlipped: isFootprintFlipped({
+        componentLayer,
+        originalLayer: footprintMetadata?.originalLayer,
       }),
     })
   }
@@ -1712,6 +1782,11 @@ export class NormalComponent<
   }
 
   _getSchematicBoxDimensions(): SchematicBoxDimensions | null {
+    if (this.schematicBoxDimensions) return this.schematicBoxDimensions
+    return this._computeSchematicBoxDimensions()
+  }
+
+  _computeSchematicBoxDimensions(): SchematicBoxDimensions | null {
     // Only valid if we don't have a schematic symbol
     if (this.getSchematicSymbol()) return null
     if (
@@ -1737,7 +1812,7 @@ export class NormalComponent<
       this._getSchematicPortArrangement() ??
       this._getImplicitSparseSchematicPortArrangement(pinCount)
 
-    const dimensions = getAllDimensionsForSchematicBox({
+    return getAllDimensionsForSchematicBox({
       schWidth: props.schWidth,
       schHeight: props.schHeight,
       schPinSpacing: pinSpacing,
@@ -1751,8 +1826,6 @@ export class NormalComponent<
       schPortArrangement,
       pinLabels: allPinLabels,
     })
-
-    return dimensions
   }
 
   getFootprinterString(): string | null {
@@ -1928,6 +2001,10 @@ export class NormalComponent<
       model_origin_alignment: "center_of_component_on_board_surface",
       anchor_alignment: "center_of_component_on_board_surface",
       model_origin_position: cadModel?.modelOriginPosition,
+      // The authored extent, carried on the record so consumers can read the
+      // part's mechanical facts from one place instead of reaching back into
+      // props -- which only works for the object form of `cadModel`.
+      ...(cadModel?.size ? { size: cadModel.size as never } : {}),
       footprinter_string: footprinterStringForCadComponent,
       show_as_translucent_model: this._parsedProps.showAsTranslucentModel,
     } as any)
@@ -1950,6 +2027,8 @@ export class NormalComponent<
       ftype: source_component.ftype,
       name: source_component.name,
       manufacturer_part_number: source_component.manufacturer_part_number,
+      standard: source_component.standard,
+      pin_count: source_component.pin_count,
       footprinterString,
     })
   }

@@ -13,11 +13,15 @@ test(
         layers={2}
         minViaHoleDiameter={0.25}
         minViaPadDiameter={0.8}
+        pcbStyle={{
+          viaHoleDiameter: "0.3mm",
+          viaPadDiameter: "0.6mm",
+        }}
         autorouter={{
           local: true,
           groupMode: "subcircuit",
         }}
-        autorouterVersion="v4"
+        autorouterVersion="beta_pipeline4"
       >
         <testpoint
           name="TP_TOP"

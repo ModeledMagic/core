@@ -1,6 +1,7 @@
 import type * as Props from "@tscircuit/props"
 
 export interface TscircuitElements {
+  antenna: Props.AntennaProps
   resistor: Props.ResistorProps
   capacitor: Props.CapacitorProps
   inductor: Props.InductorProps
@@ -23,6 +24,7 @@ export interface TscircuitElements {
   powersource: Props.PowerSourceProps
   schematicsection: Props.SchematicSectionProps
   schematicsheet: Props.SchematicSheetProps
+  schematicgraphic: Props.SchematicGraphicProps
   via: Props.ViaProps
   schematicbox: Props.SchematicBoxProps
   schematicsymbol: Props.SchematicSymbolProps

@@ -4,6 +4,7 @@ import {
   runAllPinSpecificationChecks,
   runAllPlacementChecks,
   runAllRoutingChecks,
+  runAllSchematicChecks,
 } from "@tscircuit/checks"
 import { jlcMinTolerances } from "@tscircuit/jlcpcb-manufacturing-specs"
 import { getBoundsFromPoints } from "@tscircuit/math-utils"
@@ -11,9 +12,11 @@ import { boardProps } from "@tscircuit/props"
 import type { AnyCircuitElement, LayerRef, PcbBoard } from "circuit-json"
 import { getBoardAvailableLayers } from "lib/utils/getViaSpanLayers"
 import { type Matrix, compose, translate } from "transformation-matrix"
+import type { z } from "zod"
 import { getDescendantSubcircuitIds } from "../../utils/autorouting/getAncestorSubcircuitIds"
 import { getBoardCenterFromAnchor } from "../../utils/boards/get-board-center-from-anchor"
 import { inflateCircuitJson } from "../../utils/circuit-json/inflate-circuit-json"
+import { getViaDiameterDefaults } from "../../utils/pcbStyle/getViaDiameterDefaults"
 import { NormalComponent } from "../base-components/NormalComponent/NormalComponent"
 import type { RenderPhase } from "../base-components/Renderable"
 import { DrcCheck } from "../primitive-components/DrcCheck"
@@ -22,9 +25,12 @@ import type { SubcircuitI } from "../primitive-components/Group/Subcircuit/Subci
 import { Subcircuit_doInitialRenderIsolatedSubcircuits } from "../primitive-components/Group/Subcircuit/Subcircuit_doInitialRenderIsolatedSubcircuits"
 import { Subcircuit_getSubcircuitPropHash } from "../primitive-components/Group/Subcircuit_getSubcircuitPropHash"
 import type { BoardI } from "./BoardI"
+import { Board_doInitialPcbImplicitCopperPourRender } from "./Board_doInitialPcbImplicitCopperPourRender"
 import { Board_doInitialPcbPlacementDesignRuleChecks } from "./Board_doInitialPcbPlacementDesignRuleChecks"
+import { BoardCastellatedHole } from "./board-castellated-hole"
 
 const MIN_EFFECTIVE_BORDER_RADIUS_MM = 0.01
+const DEFAULT_VIA_PAD_DIAMETER_OVER_HOLE_DIAMETER_MM = 0.15
 
 const getRoundedRectOutline = (
   width: number,
@@ -103,6 +109,19 @@ export class Board
   _drcChecksInProgress = false
   _connectedSchematicPortPairs = new Set<string>()
   _panelPositionOffset: { x: number; y: number } | null = null
+  readonly _castellatedHoles: BoardCastellatedHole[]
+
+  constructor(props: z.input<typeof boardProps>) {
+    super(props)
+    this._castellatedHoles = BoardCastellatedHole.fromBoardOutline(
+      this._parsedProps.outline,
+    )
+    for (const castellatedHole of this._castellatedHoles) {
+      if (castellatedHole.port) this.add(castellatedHole.port)
+      this.add(castellatedHole)
+      if (castellatedHole.trace) this.add(castellatedHole.trace)
+    }
+  }
 
   get isSubcircuit() {
     return true
@@ -433,6 +452,13 @@ export class Board
     const pcbBoardFromCircuitJson = circuitJsonElements?.find(
       (elm) => elm.type === "pcb_board",
     )
+    const rawProps = this.props
+    const resolvedIsViaInPadAllowed =
+      rawProps.isViaInPadAllowed ??
+      pcbBoardFromCircuitJson?.is_via_in_pad_allowed
+    const resolvedAllowBlindAndBuriedVias =
+      rawProps.allowBlindAndBuriedVias ??
+      pcbBoardFromCircuitJson?.allow_blind_and_buried_vias
 
     // Initialize with minimal dimensions if not provided
     // They will be updated in PcbBoardAutoSize phase
@@ -507,6 +533,23 @@ export class Board
       }
     }
     const subcircuitProps = this.getSubcircuit()._parsedProps
+    const pcbStyle = this.getInheritedMergedProperty("pcbStyle")
+    const styledViaDimensions = getViaDiameterDefaults(pcbStyle)
+    const configuredViaHoleDiameter =
+      subcircuitProps.minViaHoleDiameter ??
+      (pcbStyle?.viaHoleDiameter !== undefined
+        ? styledViaDimensions.holeDiameter
+        : undefined)
+    const resolvedMinViaHoleDiameter =
+      configuredViaHoleDiameter ?? jlcMinTolerances.min_via_hole_diameter
+    const resolvedMinViaPadDiameter =
+      subcircuitProps.minViaPadDiameter ??
+      (pcbStyle?.viaPadDiameter !== undefined
+        ? styledViaDimensions.padDiameter
+        : configuredViaHoleDiameter !== undefined
+          ? configuredViaHoleDiameter +
+            DEFAULT_VIA_PAD_DIAMETER_OVER_HOLE_DIAMETER_MM
+          : jlcMinTolerances.min_via_pad_diameter)
     const pcb_board = db.pcb_board.insert({
       source_board_id: this.source_board_id,
       center,
@@ -521,8 +564,11 @@ export class Board
         y: point.y + (props.outlineOffsetY ?? 0) + outlineTranslation.y,
       })),
       material: props.material,
-      ...(props.isViaInPadAllowed !== undefined && {
-        is_via_in_pad_allowed: props.isViaInPadAllowed,
+      ...(resolvedIsViaInPadAllowed !== undefined && {
+        is_via_in_pad_allowed: resolvedIsViaInPadAllowed,
+      }),
+      ...(resolvedAllowBlindAndBuriedVias !== undefined && {
+        allow_blind_and_buried_vias: resolvedAllowBlindAndBuriedVias,
       }),
       ...(props.solderMaskColor !== undefined && {
         solder_mask_color: props.solderMaskColor,
@@ -533,12 +579,8 @@ export class Board
 
       min_trace_width:
         subcircuitProps.minTraceWidth ?? jlcMinTolerances.min_trace_width,
-      min_via_hole_diameter:
-        subcircuitProps.minViaHoleDiameter ??
-        jlcMinTolerances.min_via_hole_diameter,
-      min_via_pad_diameter:
-        subcircuitProps.minViaPadDiameter ??
-        jlcMinTolerances.min_via_pad_diameter,
+      min_via_hole_diameter: resolvedMinViaHoleDiameter,
+      min_via_pad_diameter: resolvedMinViaPadDiameter,
       min_via_hole_edge_to_via_hole_edge_clearance:
         subcircuitProps.minViaHoleEdgeToViaHoleEdgeClearance ??
         jlcMinTolerances.min_via_hole_edge_to_via_hole_edge_clearance,
@@ -573,14 +615,16 @@ export class Board
   }
 
   doInitialPcbDesignRuleChecks() {
-    if (this.root?.pcbDisabled) return
-
     super.doInitialPcbDesignRuleChecks()
     this.updatePcbDesignRuleChecks()
   }
 
   doInitialPcbPlacementDesignRuleChecks() {
     Board_doInitialPcbPlacementDesignRuleChecks(this)
+  }
+
+  doInitialPcbImplicitCopperPourRender() {
+    Board_doInitialPcbImplicitCopperPourRender(this)
   }
 
   updatePcbDesignRuleChecks() {
@@ -590,6 +634,7 @@ export class Board
       this.root?.pcbRoutingDisabled ||
       this.getInheritedProperty("routingDisabled")
     const pcbDisabled = this.root?.pcbDisabled
+    const schematicDisabled = this.root?.schematicDisabled
 
     const drcChecksDisabled =
       this.root?.platform?.drcChecksDisabled ??
@@ -612,6 +657,7 @@ export class Board
       !drcChecksDisabled && !netlistDrcChecksDisabled
     const shouldRunPinSpecificationChecks =
       !drcChecksDisabled && !pinSpecificationDrcChecksDisabled
+    const shouldRunSchematicChecks = !drcChecksDisabled && !schematicDisabled
     const shouldRunPlacementChecks =
       !drcChecksDisabled && !pcbDisabled && !placementDrcChecksDisabled
     const shouldRunRoutingChecks =
@@ -646,7 +692,11 @@ export class Board
 
       if (shouldRunRoutingChecks) {
         checksToRun.push(
-          runAllRoutingChecks(circuitJson) as Promise<AnyCircuitElement[]>,
+          runAllRoutingChecks(circuitJson).then((results) =>
+            results.filter(
+              (result) => !this._isExpectedCastellatedHoleDrcError(result),
+            ),
+          ) as Promise<AnyCircuitElement[]>,
         )
       }
 
@@ -654,15 +704,19 @@ export class Board
         const existingPlacementDiagnostics = db.toArray()
         checksToRun.push(
           runAllPlacementChecks(circuitJson).then((results) =>
-            results.filter(
-              (result) =>
-                !existingPlacementDiagnostics.some(
-                  (existing) =>
-                    existing.type === result.type &&
-                    "message" in existing &&
-                    existing.message === result.message,
-                ),
-            ),
+            results
+              .filter(
+                (result) => !this._isExpectedCastellatedHoleDrcError(result),
+              )
+              .filter(
+                (result) =>
+                  !existingPlacementDiagnostics.some(
+                    (existing) =>
+                      existing.type === result.type &&
+                      "message" in existing &&
+                      existing.message === result.message,
+                  ),
+              ),
           ) as Promise<AnyCircuitElement[]>,
         )
       }
@@ -678,6 +732,12 @@ export class Board
           runAllPinSpecificationChecks(circuitJson) as Promise<
             AnyCircuitElement[]
           >,
+        )
+      }
+
+      if (shouldRunSchematicChecks) {
+        checksToRun.push(
+          runAllSchematicChecks(circuitJson) as Promise<AnyCircuitElement[]>,
         )
       }
 
@@ -705,17 +765,12 @@ export class Board
     })
   }
 
-  override _emitRenderLifecycleEvent(
-    phase: RenderPhase,
-    startOrEnd: "start" | "end",
-  ) {
-    super._emitRenderLifecycleEvent(phase, startOrEnd)
-    if (startOrEnd === "start") {
-      this.root?.emit("board:renderPhaseStarted", {
-        renderId: this._renderId,
-        phase,
-      })
-    }
+  override runRenderPhaseForChildren(phase: RenderPhase): void {
+    this.root?.emit("board:renderPhaseStarted", {
+      renderId: this._renderId,
+      phase,
+    })
+    super.runRenderPhaseForChildren(phase)
   }
 
   _repositionOnPcb(position: { x: number; y: number }): void {
@@ -760,8 +815,17 @@ export class Board
           db.pcb_board.update(this.pcb_board_id, {
             outline: newOutline,
           })
+          for (const castellatedHole of this._castellatedHoles) {
+            castellatedHole.syncPositionToBoardOutline()
+          }
         }
       }
     }
+  }
+
+  _isExpectedCastellatedHoleDrcError(result: AnyCircuitElement): boolean {
+    return this._castellatedHoles.some((castellatedHole) =>
+      castellatedHole.isExpectedBoardEdgeDrcError(result),
+    )
   }
 }

@@ -8,7 +8,7 @@ test("breakout routes sot23 regulator power rail parts without breakoutpoints", 
 
   circuit.add(
     <board width="18mm" height="12mm">
-      <breakout name="REG_BREAKOUT" autorouter="auto" padding="0.7mm">
+      <breakout name="REG_BREAKOUT" autorouter="auto" padding="1.2mm">
         <chip
           name="U1"
           footprint="sot23"
@@ -16,6 +16,10 @@ test("breakout routes sot23 regulator power rail parts without breakoutpoints", 
             pin1: "VIN",
             pin2: "GND",
             pin3: "VOUT",
+          }}
+          pinAttributes={{
+            VIN: { shouldHaveDecouplingCapacitor: false },
+            VOUT: { providesPower: true },
           }}
           pcbX={0}
           pcbY={0}

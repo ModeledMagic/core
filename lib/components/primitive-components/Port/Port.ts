@@ -22,6 +22,8 @@ import { Port_isConnectedToPower } from "./Port_isConnectedToPower"
 import { Port_tryRenderGroupPcbPort } from "./Port_tryRenderGroupPcbPort"
 import { getSourcePortNetLabelText } from "lib/utils/schematic/getSourcePortNetLabelText"
 
+const SMALL_SCHEMATIC_PIN_LABEL_FONT_SIZE = 0.12
+
 export class Port extends PrimitiveComponent<typeof portProps> {
   source_port_id: string | null = null
   pcb_port_id: string | null = null
@@ -70,7 +72,7 @@ export class Port extends PrimitiveComponent<typeof portProps> {
   }
 
   isGroupPort(): boolean {
-    return this.parent?.componentName === "Group"
+    return this.parent?.isGroup === true
   }
 
   isComponentPort(): boolean {
@@ -180,12 +182,18 @@ export class Port extends PrimitiveComponent<typeof portProps> {
    * are rendered properly.
    */
   _hasSchematicPort() {
+    const parentNormalComponent = this.getParentNormalComponent()
+    if (
+      parentNormalComponent?._parsedProps?.noSchematicRepresentation === true
+    ) {
+      return false
+    }
+
     const { schX, schY } = this._parsedProps
     if (schX !== undefined && schY !== undefined) {
       return true
     }
 
-    const parentNormalComponent = this.getParentNormalComponent()
     const symbol = parentNormalComponent?.getSchematicSymbol()
     if (symbol) {
       if (this.schematicSymbolPortDef) return true
@@ -215,8 +223,13 @@ export class Port extends PrimitiveComponent<typeof portProps> {
   _getGlobalSchematicPositionBeforeLayout(): { x: number; y: number } {
     const { schX, schY } = this._parsedProps
     if (schX !== undefined && schY !== undefined) {
-      // For ports with explicit coordinates in custom React symbols,
-      // use them as absolute coordinates (not relative to the parent)
+      if (this._getSymbolAncestor()) {
+        return applyToPoint(this.computeSchematicGlobalTransform(), {
+          x: 0,
+          y: 0,
+        })
+      }
+
       return { x: schX, y: schY }
     }
 
@@ -304,7 +317,12 @@ export class Port extends PrimitiveComponent<typeof portProps> {
   }
 
   _getMatchingPinAttributes(): PinAttributeMap[] {
-    const parentProps = (this.parent as any)?._parsedProps
+    // A port in a custom symbol is parented by <symbol>, while pinAttributes
+    // and noConnect belong to the owning chip/connector. Primitive-owned ports
+    // (for example, vias) do not have a NormalComponent ancestor, so retain the
+    // direct parent as a fallback for them.
+    const pinAttributeOwner = this.getParentNormalComponent() ?? this.parent
+    const parentProps = (pinAttributeOwner as any)?._parsedProps
     const pinAttributes = parentProps?.pinAttributes as
       | Record<string, PinAttributeMap>
       | undefined
@@ -691,11 +709,10 @@ export class Port extends PrimitiveComponent<typeof portProps> {
     const isExplicitCustomSymbolPort =
       schX !== undefined && schY !== undefined && !!this._getSymbolAncestor()
 
-    if (!localPortInfo?.side) {
+    if (isExplicitCustomSymbolPort && props.direction) {
+      this.facingDirection = props.direction
+    } else if (!localPortInfo?.side) {
       this.facingDirection = getRelativeDirection(containerCenter, portCenter)
-      if (isExplicitCustomSymbolPort && props.direction) {
-        this.facingDirection = props.direction
-      }
     } else {
       this.facingDirection = {
         left: "left",
@@ -709,13 +726,24 @@ export class Port extends PrimitiveComponent<typeof portProps> {
     const parentNormalComponent = this.getParentNormalComponent()
 
     // Derive side_of_component from direction prop for custom symbols
-    const sideOfComponent =
-      localPortInfo?.side ??
-      (props.direction === "up"
+    const sideFromDirection =
+      props.direction === "up"
         ? "top"
         : props.direction === "down"
           ? "bottom"
-          : props.direction)
+          : props.direction
+    const explicitCustomSymbolSide =
+      isExplicitCustomSymbolPort && props.direction
+        ? sideFromDirection
+        : undefined
+    const sideOfComponent =
+      explicitCustomSymbolSide ?? localPortInfo?.side ?? sideFromDirection
+    const displayPinLabelFontSize =
+      props.schPinLabelFontSize === "sm"
+        ? SMALL_SCHEMATIC_PIN_LABEL_FONT_SIZE
+        : props.schPinLabelFontSize === "default"
+          ? undefined
+          : props.schPinLabelFontSize
 
     const schematicPortInsertProps: Omit<SchematicPort, "schematic_port_id"> = {
       type: "schematic_port",
@@ -728,6 +756,7 @@ export class Port extends PrimitiveComponent<typeof portProps> {
       pin_number: props.pinNumber,
       true_ccw_index: localPortInfo?.trueIndex,
       display_pin_label: bestDisplayPinLabel,
+      display_pin_label_font_size: displayPinLabelFontSize,
       is_connected: false,
       schematic_sheet_id: this._resolveSchematicSheetId(),
     }

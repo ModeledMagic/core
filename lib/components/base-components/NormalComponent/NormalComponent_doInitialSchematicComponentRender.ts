@@ -7,6 +7,8 @@ export function NormalComponent_doInitialSchematicComponentRender(
 ): void {
   if (component.root?.schematicDisabled) return
   if (component.getCollapsedSchematicBoxAncestor()) return
+  if (component._parsedProps?.noSchematicRepresentation === true) return
+
   const { db } = component.root!
 
   // Insert warnings for invalid pin labels
@@ -56,7 +58,9 @@ export function NormalComponent_doInitialSchematicComponentRender(
   } else {
     const dimensions = component._getSchematicBoxDimensions()
     if (dimensions) {
-      component._doInitialSchematicComponentRenderWithSchematicBoxDimensions()
+      component._doInitialSchematicComponentRenderWithSchematicBoxDimensions(
+        dimensions,
+      )
     }
   }
 

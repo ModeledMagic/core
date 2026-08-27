@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test"
+import { expect, test } from "bun:test"
 import { getSimpleRouteJsonFromCircuitJson } from "lib/index"
 import { getTestFixture } from "tests/fixtures/get-test-fixture"
 
@@ -36,11 +36,12 @@ test("45 degree rects bug", () => {
   expect(simpleRouteJson).not.toHaveProperty("buses")
   expect(simpleRouteJson).toMatchInlineSnapshot(`
     {
+      "allowBlindAndBuriedVias": false,
       "bounds": {
-        "maxX": 3.95,
-        "maxY": 2.45,
-        "minX": -3.95,
-        "minY": -2.45,
+        "maxX": 3.6970562748477143,
+        "maxY": 3.6970562748477143,
+        "minX": -3.6970562748477143,
+        "minY": -3.6970562748477143,
       },
       "connections": [],
       "differentialPairs": undefined,
@@ -64,6 +65,12 @@ test("45 degree rects bug", () => {
           "center": {
             "x": 0,
             "y": 0,
+          },
+          "circuitJsonMetadata": {
+            "pcb_port_id": "pcb_port_0",
+            "pcb_smtpad_id": "pcb_smtpad_0",
+            "source_component_name": "45-degree-obs",
+            "source_port_name": "OBSTACLE",
           },
           "componentId": "pcb_component_0",
           "connectedTo": [

@@ -4,18 +4,18 @@ import {
 } from "@tscircuit/math-utils"
 import {
   type InputChip,
-  type InputPin,
   type InputProblem,
   type SectionId,
   type TextBoxes,
 } from "@tscircuit/schematic-trace-solver"
-import type { SchematicComponent, SourceNet } from "circuit-json"
+import type { SchematicComponent, SourceNet, SourceTrace } from "circuit-json"
 import { getSchematicNetLabelTextWidth } from "lib/utils/schematic/computeSchematicNetLabelCenter"
 import { convertFacingDirectionToElbowDirection } from "lib/utils/schematic/convertFacingDirectionToElbowDirection"
 import { getSchematicComponentWithTextBounds } from "lib/utils/schematic/getSchematicComponentWithTextBounds"
 import type { NetLabel } from "../../NetLabel"
 import { Port } from "../../Port"
 import { Group } from "../Group"
+import { applyInlineNetLabelEligibility } from "./applyInlineNetLabelEligibility"
 import { createCanonicalSchematicNetLabelTextResolver } from "./createCanonicalSchematicNetLabelTextResolver"
 import { getNetNameFromPorts } from "./getNetNameFromPorts"
 import { getPortForSchematicSymbolPort } from "./getPortForSchematicSymbolPort"
@@ -26,11 +26,16 @@ import {
   asSchematicPortId,
   asSourcePortId,
 } from "./port-id-types"
+import {
+  isDirectConnectionEndpointOutsideSchematicScope,
+  resolveNetLabelForPortMissingTrace,
+} from "./resolveNetLabelForPortMissingTrace"
 import { schematicTextToTextBox } from "./schematicTextToTextBounds"
 
 const DEFAULT_MAX_MSP_PAIR_DISTANCE = 2.4
 const SCHEMATIC_RAIL_NET_LABEL_HEIGHT = 0.42
 type SchematicComponentId = SchematicComponent["schematic_component_id"]
+type SourceTraceId = SourceTrace["source_trace_id"]
 
 export type SolverInputContext = {
   inputProblem: InputProblem
@@ -62,6 +67,24 @@ export type SolverInputContext = {
   userNetIdToConnKey: Map<string, string>
 
   /**
+   * Resolved label text and exact source trace for a visible endpoint of a
+   * direct trace that crosses a subcircuit boundary.
+   */
+  crossSubcircuitTraceLabelBySchematicPortId: Map<
+    SchematicPortId,
+    { text: string; sourceTraceId: SourceTraceId }
+  >
+
+  /**
+   * Port-only solver label anchors to the source trace represented at that
+   * schematic port when exactly one in-scope source trace owns the port.
+   */
+  sourceTraceIdByPortOnlyLabelSchematicPortId: Map<
+    SchematicPortId,
+    SourceTraceId
+  >
+
+  /**
    * Subcircuit connectivity map keys that came from explicit port-to-net traces,
    * e.g. <trace from=".D1 > .pin1" to="net.VCC" />.
    */
@@ -75,6 +98,12 @@ export type SolverInputContext = {
   schematicPortIdsWithExternallyRoutedRepresentations: Set<SchematicPortId>
   schPortIdToSourcePortId: Map<SchematicPortId, SourcePortId>
   netLabelsInScope: NetLabel[]
+
+  /**
+   * Solver pin pair (sorted schematic port ids joined by "::") to the
+   * source_trace_id it was derived from.
+   */
+  sourceTraceIdByPinPairKey: Map<string, SourceTraceId>
 }
 
 export function createSchematicTraceSolverInputProblem(
@@ -166,16 +195,22 @@ export function createSchematicTraceSolverInputProblem(
 
   for (const schematicComponent of schematicComponents) {
     const chipId = schematicComponent.schematic_component_id
-    const pins: InputPin[] = []
 
     const schematicPorts = db.schematic_port.list({
       schematic_component_id: schematicComponent.schematic_component_id,
     })
 
-    for (const schematicPort of schematicPorts) {
+    const pins = schematicPorts.map((schematicPort) => {
       const schematicPortId = asSchematicPortId(schematicPort.schematic_port_id)
-      pins.push({
+      const sourcePort = schematicPort.source_port_id
+        ? db.source_port.get(schematicPort.source_port_id)
+        : undefined
+      return {
         pinId: schematicPortId,
+        displayName:
+          schematicPort.display_pin_label ??
+          schematicPort.pin_number?.toString() ??
+          sourcePort?.name,
         x: schematicPort.center.x,
         y: schematicPort.center.y,
         // Pass the port's true facing direction (known from the schematic
@@ -187,8 +222,8 @@ export function createSchematicTraceSolverInputProblem(
         _facingDirection: convertFacingDirectionToElbowDirection(
           schematicPort.facing_direction ?? null,
         ),
-      })
-    }
+      }
+    })
 
     const sectionId = sectionIdBySchematicComponentId.get(
       schematicComponent.schematic_component_id,
@@ -239,6 +274,7 @@ export function createSchematicTraceSolverInputProblem(
       }
     }
   }
+  const sourcePortIdsInSchematicScope = new Set(sourcePortIdToSchPortId.keys())
   const netLabelsInScope = (opts.netLabels ?? []).filter((netLabel) =>
     netLabel._getConnectedPorts().some((port) => {
       if (!port.schematic_port_id) return false
@@ -247,13 +283,36 @@ export function createSchematicTraceSolverInputProblem(
       )
     }),
   )
+  const schematicPortIdsWithExplicitNetLabels = new Set(
+    netLabelsInScope
+      .filter((netLabel) => !netLabel._parsedProps.inline)
+      .flatMap((netLabel) => netLabel._getConnectedPorts())
+      .map((port) => port.schematic_port_id)
+      .filter(
+        (schematicPortId): schematicPortId is SchematicPortId =>
+          schematicPortId !== null && schematicPortId !== undefined,
+      )
+      .map(asSchematicPortId),
+  )
   const solverManagedNetLabelSchematicPortIds = new Set(
     netLabelsInScope
       .filter(
         (netLabel) =>
-          netLabel._parsedProps.schX === undefined &&
-          netLabel._parsedProps.schY === undefined,
+          netLabel._parsedProps.inline ||
+          (netLabel._parsedProps.schX === undefined &&
+            netLabel._parsedProps.schY === undefined),
       )
+      .flatMap((netLabel) => netLabel._getConnectedPorts())
+      .map((port) => port.schematic_port_id)
+      .filter(
+        (schematicPortId): schematicPortId is SchematicPortId =>
+          schematicPortId !== null && schematicPortId !== undefined,
+      )
+      .map(asSchematicPortId),
+  )
+  const schematicPortIdsWithInlineNetLabels = new Set(
+    netLabelsInScope
+      .filter((netLabel) => netLabel._parsedProps.inline)
       .flatMap((netLabel) => netLabel._getConnectedPorts())
       .map((port) => port.schematic_port_id)
       .filter(
@@ -326,13 +385,51 @@ export function createSchematicTraceSolverInputProblem(
     }
   }
 
+  for (const net of db.source_net
+    .list()
+    .filter(
+      (sourceNet) =>
+        !sourceNet.subcircuit_id ||
+        allowedSubcircuitIds.has(sourceNet.subcircuit_id),
+    )) {
+    if (net.subcircuit_connectivity_map_key) {
+      connKeyToSourceNet.set(net.subcircuit_connectivity_map_key, net)
+    }
+  }
+
   // Direct connections derived from explicit source_traces
   const directConnections: Array<{
     schematicPortIds: [SchematicPortId, SchematicPortId]
     netId?: string
     netLabelWidth?: number
+    allowInlineNetLabel?: boolean
+    inlineNetLabelWidth?: number
+    inlineNetLabelHeight?: number
+    /**
+     * Retained only to decide inline-label eligibility below; stripped before
+     * the problem is handed to the solver.
+     */
+    connKey?: string
+  }> = []
+  const singlePortTraceNetConnections: Array<{
+    netId: string
+    schematicPortIds: SchematicPortId[]
+    netLabelWidth: number
   }> = []
   const connectedPairKeys = new Set<string>()
+  const crossSubcircuitTraceLabelBySchematicPortId = new Map<
+    SchematicPortId,
+    { text: string; sourceTraceId: SourceTraceId }
+  >()
+  const sourceTraceIdsByPortOnlyLabelSchematicPortId = new Map<
+    SchematicPortId,
+    Set<SourceTraceId>
+  >()
+  /**
+   * Solver pin pair (sorted, "::"-joined) to the source trace it came from, so
+   * a placement the solver hands back can be traced to its source_trace.
+   */
+  const sourceTraceIdByPinPairKey = new Map<string, SourceTraceId>()
   const connKeysWithExplicitPortNetTraces = new Set<string>()
   for (const sourceTrace of tracesInScope) {
     if (
@@ -346,10 +443,7 @@ export function createSchematicTraceSolverInputProblem(
     }
   }
 
-  for (const st of db.source_trace.list()) {
-    if (st.subcircuit_id && !allowedSubcircuitIds.has(st.subcircuit_id)) {
-      continue
-    }
+  for (const st of tracesInScope) {
     const connected = (st.connected_source_port_ids ?? [])
       .map((sourcePortId) =>
         sourcePortIdToSchPortId.get(asSourcePortId(sourcePortId)),
@@ -360,7 +454,88 @@ export function createSchematicTraceSolverInputProblem(
           schematicPortIdsInScope.has(schematicPortId!),
       )
 
-    if (connected.length >= 2) {
+    const sourcePortIdForSingleConnectedEndpoint =
+      connected.length === 1
+        ? schPortIdToSourcePortId.get(connected[0])
+        : undefined
+    const otherSourcePortId = sourcePortIdForSingleConnectedEndpoint
+      ? st.connected_source_port_ids
+          .map(asSourcePortId)
+          .find(
+            (sourcePortId) =>
+              sourcePortId !== sourcePortIdForSingleConnectedEndpoint,
+          )
+      : undefined
+    const crossesSchematicScopeBoundary = Boolean(
+      sourcePortIdForSingleConnectedEndpoint &&
+        otherSourcePortId &&
+        isDirectConnectionEndpointOutsideSchematicScope({
+          db,
+          sourcePortId: sourcePortIdForSingleConnectedEndpoint,
+          otherSourcePortId,
+          sourcePortIdsInSchematicScope,
+          schematicSheetId: opts.schematicSheetId,
+        }),
+    )
+
+    if (
+      connected.length === 1 &&
+      st.connected_source_port_ids.length === 2 &&
+      crossesSchematicScopeBoundary &&
+      st.connected_source_net_ids.length === 0 &&
+      st.subcircuit_connectivity_map_key
+    ) {
+      const schematicPortId = connected[0]
+      const sourcePortId = schPortIdToSourcePortId.get(schematicPortId)
+      if (sourcePortId) {
+        const connKey = st.subcircuit_connectivity_map_key
+        const connectedSourcePortIdsForKey = Array.from(schematicPortIdsInScope)
+          .map((portId) => schPortIdToSourcePortId.get(portId))
+          .filter((sourcePortId): sourcePortId is SourcePortId => {
+            if (!sourcePortId) return false
+            return (
+              db.source_port.get(sourcePortId)
+                ?.subcircuit_connectivity_map_key === connKey
+            )
+          })
+        const { text } = resolveNetLabelForPortMissingTrace({
+          group,
+          sourcePortId,
+          connectedSourcePortIdsForKey,
+          sourcePortIdsInSchematicScope,
+          schematicSheetId: opts.schematicSheetId,
+          connKey,
+          sourceNet: connKeyToSourceNet.get(connKey),
+        })
+        if (
+          text &&
+          !crossSubcircuitTraceLabelBySchematicPortId.has(schematicPortId)
+        ) {
+          crossSubcircuitTraceLabelBySchematicPortId.set(schematicPortId, {
+            text,
+            sourceTraceId: st.source_trace_id,
+          })
+          userNetIdToConnKey.set(text, connKey)
+          singlePortTraceNetConnections.push({
+            netId: text,
+            schematicPortIds: [schematicPortId],
+            netLabelWidth: Number(
+              getSchematicNetLabelTextWidth({ text }).toFixed(2),
+            ),
+          })
+        }
+      }
+    } else if (connected.length >= 2) {
+      for (const schematicPortId of connected) {
+        const sourceTraceIds =
+          sourceTraceIdsByPortOnlyLabelSchematicPortId.get(schematicPortId) ??
+          new Set<SourceTraceId>()
+        sourceTraceIds.add(st.source_trace_id)
+        sourceTraceIdsByPortOnlyLabelSchematicPortId.set(
+          schematicPortId,
+          sourceTraceIds,
+        )
+      }
       const traceLabel = st.name ?? st.display_name
       const userNetId = traceLabel ?? st.source_trace_id
       if (st.subcircuit_connectivity_map_key) {
@@ -408,10 +583,12 @@ export function createSchematicTraceSolverInputProblem(
         const pairKey = [a, b].sort().join("::")
         if (connectedPairKeys.has(pairKey)) continue
         connectedPairKeys.add(pairKey)
+        sourceTraceIdByPinPairKey.set(pairKey, st.source_trace_id)
         directConnections.push({
           schematicPortIds: [a, b],
           netId: userNetId,
           netLabelWidth,
+          connKey: st.subcircuit_connectivity_map_key,
         })
       }
     }
@@ -421,18 +598,15 @@ export function createSchematicTraceSolverInputProblem(
   const netConnections: Array<{
     netId: string
     schematicPortIds: SchematicPortId[]
+    isGround?: boolean
     netLabelWidth?: number
     netLabelHeight?: number
-  }> = []
-  for (const net of db.source_net
-    .list()
-    .filter(
-      (n) => !n.subcircuit_id || allowedSubcircuitIds.has(n.subcircuit_id!),
-    )) {
-    if (net.subcircuit_connectivity_map_key) {
-      connKeyToSourceNet.set(net.subcircuit_connectivity_map_key, net)
-    }
-  }
+    allowInlineNetLabel?: boolean
+    inlineNetLabelWidth?: number
+    inlineNetLabelHeight?: number
+    /** Retained for inline-label eligibility; stripped at the solver boundary. */
+    connKey?: string
+  }> = [...singlePortTraceNetConnections]
 
   /**
    * Subcircuit connectivity map key to schematic port ids
@@ -498,11 +672,35 @@ export function createSchematicTraceSolverInputProblem(
       netConnections.push({
         netId: userNetId,
         schematicPortIds: uniqueSchematicPortIds,
+        isGround: sourceNet.is_ground,
         netLabelWidth,
         netLabelHeight,
+        connKey,
       })
     }
   }
+
+  applyInlineNetLabelEligibility({
+    directConnections,
+    netConnections,
+    connKeyToSchematicPortIds,
+    connKeyToSourceNet,
+    connKeysWithExplicitPortNetTraces,
+    schematicPortIdsWithExplicitNetLabels,
+    schematicPortIdsWithInlineNetLabels,
+    areSchematicPortsOnDifferentComponents: (schematicPortIds) => {
+      const componentIds = schematicPortIds.map(
+        (schematicPortId) =>
+          db.schematic_port.get(schematicPortId)?.schematic_component_id,
+      )
+      return (
+        componentIds.every((componentId): componentId is string =>
+          Boolean(componentId),
+        ) && componentIds[0] !== componentIds[1]
+      )
+    },
+    resolveCanonicalNetLabelText,
+  })
 
   // Available net label orientations from source_net naming conventions
   const availableNetLabelOrientations: Record<string, AxisDirection[]> =
@@ -524,19 +722,22 @@ export function createSchematicTraceSolverInputProblem(
           netToAllowedOrientations[net.name] = ["x-", "x+"]
         }
       }
+      for (const { netId } of singlePortTraceNetConnections) {
+        netToAllowedOrientations[netId] ??= ["x-", "x+"]
+      }
       return netToAllowedOrientations
     })()
 
   const inputProblem: InputProblem = {
     chips,
     directConnections: directConnections.map(
-      ({ schematicPortIds, ...connection }) => ({
+      ({ schematicPortIds, connKey, ...connection }) => ({
         ...connection,
         pinIds: schematicPortIds,
       }),
     ),
     netConnections: netConnections.map(
-      ({ schematicPortIds, ...connection }) => ({
+      ({ schematicPortIds, connKey, ...connection }) => ({
         ...connection,
         pinIds: schematicPortIds,
       }),
@@ -547,14 +748,26 @@ export function createSchematicTraceSolverInputProblem(
       group._parsedProps.schMaxTraceDistance ?? DEFAULT_MAX_MSP_PAIR_DISTANCE,
   }
 
+  const sourceTraceIdByPortOnlyLabelSchematicPortId = new Map(
+    Array.from(sourceTraceIdsByPortOnlyLabelSchematicPortId).flatMap(
+      ([schematicPortId, sourceTraceIds]) => {
+        if (sourceTraceIds.size !== 1) return []
+        return [[schematicPortId, sourceTraceIds.values().next().value!]]
+      },
+    ),
+  )
+
   return {
     inputProblem,
     connKeyToSourceNet,
     userNetIdToConnKey,
+    crossSubcircuitTraceLabelBySchematicPortId,
+    sourceTraceIdByPortOnlyLabelSchematicPortId,
     connKeysWithExplicitPortNetTraces,
     schematicPortIdsInScope,
     schematicPortIdsWithExternallyRoutedRepresentations,
     schPortIdToSourcePortId,
     netLabelsInScope,
+    sourceTraceIdByPinPairKey,
   }
 }

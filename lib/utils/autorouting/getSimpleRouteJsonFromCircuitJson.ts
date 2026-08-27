@@ -1,6 +1,13 @@
 import type { CircuitJsonUtilObjects } from "@tscircuit/circuit-json-util"
 import { su } from "@tscircuit/circuit-json-util"
-import type { AnyCircuitElement, PcbBoard, SourcePort } from "circuit-json"
+import type {
+  AnyCircuitElement,
+  LayerRef,
+  PcbBoard,
+  PcbPort,
+  PcbVia,
+  SourcePort,
+} from "circuit-json"
 import {
   ConnectivityMap,
   getFullConnectivityMapFromCircuitJson,
@@ -8,13 +15,16 @@ import {
 import { Bus } from "lib/components/primitive-components/Bus"
 import { DifferentialPair } from "lib/components/primitive-components/DifferentialPair"
 import type { ISubcircuit } from "lib/components/primitive-components/Group/Subcircuit/ISubcircuit"
+import { getViaSpanLayers } from "lib/utils/getViaSpanLayers"
 import { getObstaclesFromCircuitJson } from "../obstacles/getObstaclesFromCircuitJson"
 import type {
   PcbGroupId,
   SimpleRouteConnection,
   SimpleRouteDifferentialPair,
   SimpleRouteJson,
+  SimpleRoutePoint,
 } from "./SimpleRouteJson"
+import { expandSrjBoundsToIncludeConnectionPoints } from "./expand-srj-bounds-to-include-connection-points"
 import { getDescendantSubcircuitIds } from "./getAncestorSubcircuitIds"
 import {
   type FanoutPourNetMap,
@@ -24,6 +34,43 @@ import {
 import { getDifferentialPairsForSimpleRouteJson } from "./getDifferentialPairsForSimpleRouteJson"
 import { getPreservedRoutedSubcircuitTraces } from "./getPreservedRoutedSubcircuitTraces"
 import { getUnbrokenCopperPourObstacles } from "./getUnbrokenCopperPourObstacles"
+
+const getOwningPcbBoardForSubcircuit = (
+  db: CircuitJsonUtilObjects,
+  subcircuitId: string,
+): { board: PcbBoard | null; subcircuitIsBoard: boolean } => {
+  const visitedSubcircuitIds = new Set<string>()
+  let currentSubcircuitId: string | null = subcircuitId
+  let isRequestedSubcircuit = true
+
+  while (
+    currentSubcircuitId &&
+    !visitedSubcircuitIds.has(currentSubcircuitId)
+  ) {
+    visitedSubcircuitIds.add(currentSubcircuitId)
+    const sourceGroup = db.source_group.getWhere({
+      subcircuit_id: currentSubcircuitId,
+    })
+    const sourceBoard = sourceGroup
+      ? db.source_board.getWhere({
+          source_group_id: sourceGroup.source_group_id,
+        })
+      : undefined
+    if (sourceBoard) {
+      return {
+        board:
+          db.pcb_board.getWhere({
+            source_board_id: sourceBoard.source_board_id,
+          }) ?? null,
+        subcircuitIsBoard: isRequestedSubcircuit,
+      }
+    }
+    currentSubcircuitId = sourceGroup?.parent_subcircuit_id ?? null
+    isRequestedSubcircuit = false
+  }
+
+  return { board: null, subcircuitIsBoard: false }
+}
 
 /**
  * This function can only be called in the PcbTraceRender phase or later
@@ -43,6 +90,7 @@ export const getSimpleRouteJsonFromCircuitJson = ({
   minViaPadDiameter,
   nominalTraceWidth,
   subcircuitComponent,
+  routingPcbGroupId,
   fanoutPourNetMap,
   ignoreExistingTopLevelPcbRouteState = false,
 }: {
@@ -62,6 +110,11 @@ export const getSimpleRouteJsonFromCircuitJson = ({
   subcircuitComponent?: Pick<ISubcircuit, "selectAll"> & {
     pcb_group_id?: PcbGroupId | null
   }
+  /**
+   * Selects the routing group used to bound outline-less copper pours. Other
+   * SRJ content retains its normal subcircuit-wide semantics.
+   */
+  routingPcbGroupId?: PcbGroupId
   /**
    * Copper plane intent used by fanout routing. Source-only traces whose nets
    * are mapped here become internal plane-terminated buses in SRJ.
@@ -105,14 +158,9 @@ export const getSimpleRouteJsonFromCircuitJson = ({
   let board: PcbBoard | undefined | null = null
   let subcircuitIsBoard = false
   if (subcircuit_id) {
-    const source_group_id = subcircuit_id.replace(/^subcircuit_/, "")
-    const source_board = db.source_board.getWhere({ source_group_id })
-    if (source_board) {
-      board = db.pcb_board.getWhere({
-        source_board_id: source_board.source_board_id,
-      })
-      if (board) subcircuitIsBoard = true
-    }
+    const owningBoard = getOwningPcbBoardForSubcircuit(db, subcircuit_id)
+    board = owningBoard.board
+    subcircuitIsBoard = owningBoard.subcircuitIsBoard && board !== null
   }
 
   if (!board) {
@@ -128,12 +176,15 @@ export const getSimpleRouteJsonFromCircuitJson = ({
     if (!sourceComponent?.name) return undefined
     return `${sourceComponent.name}.${sourcePort.name}`
   }
-  const pcbGroup = subcircuit_id
-    ? db.pcb_group.getWhere({ subcircuit_id })
-    : undefined
-  const activeRoutingPcbGroupId =
-    subcircuitComponent?.pcb_group_id ??
-    (!subcircuitIsBoard ? pcbGroup?.pcb_group_id : undefined)
+  const pcbGroup = routingPcbGroupId
+    ? db.pcb_group.get(routingPcbGroupId)
+    : subcircuit_id
+      ? db.pcb_group.getWhere({ subcircuit_id })
+      : undefined
+  let activeRoutingPcbGroupId = subcircuitComponent?.pcb_group_id
+  if (activeRoutingPcbGroupId == null && !subcircuitIsBoard) {
+    activeRoutingPcbGroupId = pcbGroup?.pcb_group_id
+  }
 
   const sharedConnMap =
     getFullConnectivityMapFromCircuitJson(subcircuitElements)
@@ -151,9 +202,60 @@ export const getSimpleRouteJsonFromCircuitJson = ({
       ? breakoutPoint.pcb_group_id === activeRoutingPcbGroupId
       : !subcircuitIsBoard)
 
+  // SRJ uses two separate fields for routing state:
+  // - connections: copper the current autorouter still needs to create.
+  // - traces: copper that already exists and must be preserved.
+  //
+  // Manual copper is rendered before autorouting, and child subcircuits are
+  // autorouted before their parent board. Those existing routes belong in
+  // `traces`, not `connections`; otherwise later routing can cross or recreate
+  // them.
+  //
+  // Keep connectivity metadata on preserved traces so parent routes can
+  // legally touch child fanout copper that belongs to the same connected net.
+  const preservedRoutedSubcircuitTraces = getPreservedRoutedSubcircuitTraces({
+    scopedDb: db,
+    relevantSubcircuitIds,
+  })
+  const preservedSrjTraceByPcbTraceId = new Map(
+    preservedRoutedSubcircuitTraces.map((trace) => [trace.pcb_trace_id, trace]),
+  )
+  const isPcbViaRepresentedByPreservedSrjTrace = (via: PcbVia): boolean => {
+    if (!via.pcb_trace_id) return false
+    const preservedTrace = preservedSrjTraceByPcbTraceId.get(via.pcb_trace_id)
+    if (!preservedTrace) return false
+    const pcbViaLayerNames = new Set(via.layers)
+
+    return preservedTrace.route.some((routePoint) => {
+      // Both positions are circuit-world points in mm copied from the same
+      // Circuit JSON route, so an exact coordinate comparison is intentional.
+      if (
+        routePoint.route_type !== "via" ||
+        routePoint.x !== via.x ||
+        routePoint.y !== via.y
+      ) {
+        return false
+      }
+      const routeViaLayerNames = new Set(
+        getViaSpanLayers({
+          fromLayer: routePoint.from_layer as LayerRef,
+          toLayer: routePoint.to_layer as LayerRef,
+          layerCount: board?.num_layers ?? 2,
+        }),
+      )
+      return (
+        routeViaLayerNames.size === pcbViaLayerNames.size &&
+        [...routeViaLayerNames].every((layer) => pcbViaLayerNames.has(layer))
+      )
+    })
+  }
+
   const obstacles = getObstaclesFromCircuitJson(
     [
       ...(board ? [board] : []),
+      ...db.source_component.list(),
+      ...db.source_port.list(),
+      ...db.pcb_port.list(),
       ...db.pcb_component.list(),
       ...db.pcb_smtpad.list(),
       ...db.pcb_plated_hole.list(),
@@ -164,7 +266,9 @@ export const getSimpleRouteJsonFromCircuitJson = ({
         .list()
         .filter(
           (via) =>
-            !ignoreExistingTopLevelPcbRouteState || Boolean(via.subcircuit_id),
+            (!ignoreExistingTopLevelPcbRouteState ||
+              Boolean(via.subcircuit_id)) &&
+            !isPcbViaRepresentedByPreservedSrjTrace(via),
         ),
       ...db.pcb_keepout.list(),
       ...db.pcb_cutout.list(),
@@ -184,23 +288,6 @@ export const getSimpleRouteJsonFromCircuitJson = ({
       group: pcbGroup,
     }),
   )
-
-  // SRJ uses two separate fields for routing state:
-  // - connections: copper the current autorouter still needs to create.
-  // - traces: copper that already exists and must be preserved.
-  //
-  // Child subcircuits are autorouted before their parent board. Those
-  // child routes belong in `traces`, not `connections`; otherwise the parent
-  // autorouter receives the same child-internal source_trace as new work and
-  // may route it a second time.
-  //
-  // Keep connectivity metadata on preserved traces so parent routes can
-  // legally touch child fanout copper that belongs to the same connected net.
-  const preservedRoutedSubcircuitTraces = getPreservedRoutedSubcircuitTraces({
-    scopedDb: db,
-    currentSubcircuitId: subcircuit_id,
-    relevantSubcircuitIds,
-  })
 
   // Add every equivalent ID from the shared connectivity map to each obstacle.
   for (const obstacle of obstacles) {
@@ -359,6 +446,40 @@ export const getSimpleRouteJsonFromCircuitJson = ({
     if (spId) sourcePortIdToBreakoutPoint.set(spId, bp)
   }
 
+  const getPcbPortRoutePoint = (
+    pcbPort: PcbPort,
+  ): SimpleRoutePoint & { pointId: string } => {
+    const layer = pcbPort.layers?.[0] ?? "top"
+    const breakoutPoint = sourcePortIdToBreakoutPoint.get(
+      pcbPort.source_port_id,
+    )
+    const portSelector = getPortSelector(
+      db.source_port.get(pcbPort.source_port_id),
+    )
+
+    // A parent routing scope connects to the child's boundary endpoint. The
+    // child-owned routing scope still connects the physical pad to that same
+    // breakout point.
+    if (breakoutPoint && !breakoutPointIsInActiveRoutingGroup(breakoutPoint)) {
+      return {
+        x: breakoutPoint.x,
+        y: breakoutPoint.y,
+        layer: breakoutPoint.layer ?? layer,
+        pointId: breakoutPoint.pcb_breakout_point_id,
+        port_selector: portSelector,
+      }
+    }
+
+    return {
+      x: pcbPort.x,
+      y: pcbPort.y,
+      layer,
+      pointId: pcbPort.pcb_port_id,
+      pcb_port_id: pcbPort.pcb_port_id,
+      port_selector: portSelector,
+    }
+  }
+
   // Create connections from source traces in this routing scope. Any
   // source_trace represented by `preservedRoutedSubcircuitTraces` is excluded
   // here so it is preserved as fixed copper instead of re-routed.
@@ -381,27 +502,24 @@ export const getSimpleRouteJsonFromCircuitJson = ({
         !subcircuit_id || (trace as any).subcircuit_id === subcircuit_id,
     )
     .map((trace) => {
-      const connectedPorts = trace.connected_source_port_ids.map((id) => {
-        const source_port = db.source_port.get(id)
-        const pcb_port = db.pcb_port.getWhere({ source_port_id: id })
-        return {
-          ...source_port,
-          ...pcb_port,
-        }
-      })
+      const connectedPcbPorts = trace.connected_source_port_ids
+        .map((sourcePortId) =>
+          db.pcb_port.getWhere({ source_port_id: sourcePortId }),
+        )
+        .filter((pcbPort): pcbPort is PcbPort => pcbPort !== null)
 
       const isPlaneTerminatedSourceTrace = planeTerminatedSourceTraceLayers.has(
         trace.source_trace_id,
       )
       if (
-        connectedPorts.length < 2 &&
-        !(isPlaneTerminatedSourceTrace && connectedPorts.length === 1)
+        connectedPcbPorts.length < 2 &&
+        !(isPlaneTerminatedSourceTrace && connectedPcbPorts.length === 1)
       ) {
         return null
       }
 
       // TODO handle trace.connected_source_net_ids
-      for (const connectedPort of connectedPorts) {
+      for (const connectedPort of connectedPcbPorts) {
         if (connectedPort.x === undefined || connectedPort.y === undefined) {
           console.error(
             `(source_port_id: ${connectedPort.source_port_id}) for trace ${trace.source_trace_id} does not have x/y coordinates. Skipping this trace.`,
@@ -411,7 +529,7 @@ export const getSimpleRouteJsonFromCircuitJson = ({
       }
 
       const connectedPcbPortIds = new Set(
-        connectedPorts.map((port) => port.pcb_port_id),
+        connectedPcbPorts.map((port) => port.pcb_port_id),
       )
       // Collect all traceHints that apply to any connected port
       const matchingHints = traceHints.filter((hint) =>
@@ -432,39 +550,8 @@ export const getSimpleRouteJsonFromCircuitJson = ({
         }
       }
 
-      // For cross-boundary traces, use the breakout point instead of
-      // the matched inner port so the autorouter routes to the breakout
-      // boundary, not directly to the inner port.
-      const getPortOrBreakoutPoint = (
-        port: (typeof connectedPorts)[0],
-        layer: string,
-        sourcePortId: string,
-      ) => {
-        const bp = sourcePortIdToBreakoutPoint.get(sourcePortId)
-        const portSelector = getPortSelector(db.source_port.get(sourcePortId))
-        if (bp && !breakoutPointIsInActiveRoutingGroup(bp)) {
-          return {
-            x: bp.x,
-            y: bp.y,
-            layer,
-            port_selector: portSelector,
-          }
-        }
-        return {
-          x: port.x!,
-          y: port.y!,
-          layer,
-          pointId: port.pcb_port_id,
-          pcb_port_id: port.pcb_port_id,
-          port_selector: portSelector,
-        }
-      }
-      const connectedPortRoutePoints = connectedPorts.map((port, index) =>
-        getPortOrBreakoutPoint(
-          port,
-          port.layers?.[0] ?? "top",
-          trace.connected_source_port_ids[index],
-        ),
+      const connectedPortRoutePoints = connectedPcbPorts.map((port) =>
+        getPcbPortRoutePoint(port),
       )
       const [firstConnectedPortRoutePoint, ...remainingPortRoutePoints] =
         connectedPortRoutePoints
@@ -611,16 +698,10 @@ export const getSimpleRouteJsonFromCircuitJson = ({
         .filter((p) => st.connected_source_port_ids.includes(p.source_port_id))
 
       for (const p of pcb_ports) {
-        if (addedPointIds.has(p.pcb_port_id)) continue
-        addedPointIds.add(p.pcb_port_id)
-        pointsToConnect.push({
-          x: p.x!,
-          y: p.y!,
-          layer: (p.layers?.[0] as any) ?? "top",
-          pointId: p.pcb_port_id,
-          pcb_port_id: p.pcb_port_id,
-          port_selector: getPortSelector(db.source_port.get(p.source_port_id)),
-        })
+        const routePoint = getPcbPortRoutePoint(p)
+        if (addedPointIds.has(routePoint.pointId)) continue
+        addedPointIds.add(routePoint.pointId)
+        pointsToConnect.push(routePoint)
       }
     }
 
@@ -644,7 +725,12 @@ export const getSimpleRouteJsonFromCircuitJson = ({
 
   for (const bp of breakoutPoints) {
     const bpSourcePortId = (bp as any).source_port_id as string | undefined
-    const pt = { x: bp.x, y: bp.y, layer: "top" as const }
+    const pt = {
+      x: bp.x,
+      y: bp.y,
+      layer: bp.layer ?? "top",
+      pointId: bp.pcb_breakout_point_id,
+    }
 
     if (bpSourcePortId) {
       const pcb_port = db.pcb_port.getWhere({
@@ -709,10 +795,17 @@ export const getSimpleRouteJsonFromCircuitJson = ({
     }
   }
 
+  // Plane-terminated one-point traces are emitted by directTraceConnections.
+  // A net-derived connection needs at least two physical points; breakout-point
+  // processing above may have supplied the second point.
+  const routableConnectionsFromNets = connectionsFromNets.filter(
+    (connection) => connection.pointsToConnect.length >= 2,
+  )
+
   // ----- 1. Gather all connections we are about to return
   const allConns: SimpleRouteConnection[] = [
     ...directTraceConnections,
-    ...connectionsFromNets,
+    ...routableConnectionsFromNets,
     ...connectionsFromBreakoutPoints,
   ]
   const defaultTraceWidth = minTraceWidth ?? board?.min_trace_width ?? 0.1
@@ -720,6 +813,11 @@ export const getSimpleRouteJsonFromCircuitJson = ({
     conn.nominalTraceWidth ??= nominalTraceWidth ?? defaultTraceWidth
     conn.width ??= nominalTraceWidth ?? defaultTraceWidth
   }
+
+  bounds = expandSrjBoundsToIncludeConnectionPoints({
+    bounds,
+    connections: allConns,
+  })
 
   const differentialPairs: DifferentialPair[] =
     subcircuitComponent?.selectAll<DifferentialPair>("differentialpair") ?? []
@@ -806,6 +904,7 @@ export const getSimpleRouteJsonFromCircuitJson = ({
           ? preservedRoutedSubcircuitTraces
           : undefined,
       layerCount: board?.num_layers ?? 2,
+      allowBlindAndBuriedVias: board?.allow_blind_and_buried_vias ?? false,
       minTraceWidth: Math.min(
         defaultTraceWidth,
         ...allConns.map((c) => c.width!),

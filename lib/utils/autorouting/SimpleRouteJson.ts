@@ -3,6 +3,9 @@ import type {
   SimplifiedPcbTrace as AutorouterSimplifiedPcbTrace,
 } from "@tscircuit/capacity-autorouter"
 import type { PcbGroup } from "circuit-json"
+import type { CircuitJsonMetadata, Obstacle } from "../obstacles/types"
+
+export type { CircuitJsonMetadata, Obstacle } from "../obstacles/types"
 
 export type PcbGroupId = PcbGroup["pcb_group_id"]
 export type SimpleRouteBounds = {
@@ -34,6 +37,8 @@ export type SimplifiedPcbTrace = Omit<
         y: number
         to_layer: string
         from_layer: string
+        /** Physical copper layers occupied by the drilled barrel. */
+        layers?: string[]
         via_diameter?: number
         via_hole_diameter?: number
       }
@@ -51,26 +56,9 @@ export type SimplifiedPcbTrace = Omit<
         from_layer: string
         to_layer: string
         width: number
+        circuitJsonMetadata?: CircuitJsonMetadata
       }
   >
-}
-
-export type Obstacle = {
-  obstacleId?: string
-  componentId?: string
-  // TODO include ovals
-  type: "rect"
-  shape?: "circle"
-  layers: string[]
-  zLayers?: number[]
-  center: { x: number; y: number }
-  width: number
-  height: number
-  ccwRotationDegrees?: number
-  connectedTo: string[]
-  isCopperPour?: boolean
-  netIsAssignable?: boolean
-  offBoardConnectsTo?: string[]
 }
 
 /** A connection identifier in Simple Route JSON. */
@@ -129,9 +117,21 @@ export type SimpleRouteBus = {
   busId: string
   name?: string
   connectionNames: SrjConnectionName[]
+  /**
+   * Per-connection downstream points that should guide fanout boundary exits.
+   * These are routing hints and do not replace electrical endpoints. A known
+   * layer lets paired fanouts preserve a compatible winding order.
+   */
+  connectionExitTargets?: Readonly<
+    Record<SrjConnectionName, { x: number; y: number; layer?: string }>
+  >
   maxLengthSkew?: number
   traceWidth?: number
   allowedLayers?: string[]
+  /** Highest-priority fanout layer for this bus. */
+  preferredLayer?: string
+  /** Additional preferred fanout layers for this bus, in priority order. */
+  preferredLayers?: string[]
   termination?: SimpleRouteBusTermination
 }
 
@@ -148,6 +148,8 @@ export type SimpleRouteJson = Omit<
   | "buses"
 > & {
   layerCount: number
+  /** Whether autorouters may use vias that do not span the full board stack. */
+  allowBlindAndBuriedVias?: boolean
   minTraceWidth: number
   nominalTraceWidth?: number
   /** @deprecated Use `min_via_pad_diameter` / `minViaPadDiameter` instead. */
