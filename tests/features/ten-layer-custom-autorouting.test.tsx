@@ -3,9 +3,21 @@ import type { LayerRef } from "circuit-json"
 import { createBasicAutorouter } from "tests/fixtures/createBasicAutorouter"
 import { getTestFixture } from "tests/fixtures/get-test-fixture"
 
-test("Core carries an inner8 route through the full autorouting pipeline", async () => {
+test("Core keeps an inner8 logical route on physical through-all vias", async () => {
   const { circuit } = getTestFixture()
   let autorouterLayerCount: number | undefined
+  const throughAllLayers: LayerRef[] = [
+    "top",
+    "inner1",
+    "inner2",
+    "inner3",
+    "inner4",
+    "inner5",
+    "inner6",
+    "inner7",
+    "inner8",
+    "bottom",
+  ]
 
   circuit.add(
     <board
@@ -42,6 +54,7 @@ test("Core carries an inner8 route through the full autorouting pipeline", async
                   y: start.y,
                   from_layer: "top",
                   to_layer: "inner8",
+                  layers: throughAllLayers,
                 },
                 {
                   route_type: "wire",
@@ -63,6 +76,7 @@ test("Core carries an inner8 route through the full autorouting pipeline", async
                   y: end.y,
                   from_layer: "inner8",
                   to_layer: "top",
+                  layers: throughAllLayers,
                 },
                 {
                   route_type: "wire",
@@ -96,20 +110,21 @@ test("Core carries an inner8 route through the full autorouting pipeline", async
       ),
   ).toBe(true)
 
-  const topToInner8Layers: LayerRef[] = [
-    "top",
-    "inner1",
-    "inner2",
-    "inner3",
-    "inner4",
-    "inner5",
-    "inner6",
-    "inner7",
-    "inner8",
-  ]
-  expect(circuit.db.pcb_via.list()).toHaveLength(2)
-  expect(circuit.db.pcb_via.list().map((via) => via.layers)).toEqual([
-    topToInner8Layers,
-    [...topToInner8Layers].reverse(),
+  expect(
+    circuit.db.pcb_trace
+      .list()
+      .flatMap((trace) => trace.route)
+      .filter((routePoint) => routePoint.route_type === "via")
+      .every((routePoint) => !("layers" in routePoint)),
+  ).toBe(true)
+  const vias = circuit.db.pcb_via.list()
+  expect(vias).toHaveLength(2)
+  expect(vias.map((via) => via.layers)).toEqual([
+    throughAllLayers,
+    throughAllLayers,
+  ])
+  expect(vias.map((via) => [via.from_layer, via.to_layer])).toEqual([
+    ["top", "inner8"],
+    ["inner8", "top"],
   ])
 })

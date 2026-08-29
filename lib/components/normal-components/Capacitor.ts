@@ -1,14 +1,27 @@
 import { capacitorProps } from "@tscircuit/props"
 import type { SourceSimpleCapacitorInput } from "circuit-json"
+import { formatSiUnit } from "format-si-unit"
 import {
-  FTYPE,
   type BaseSymbolName,
+  FTYPE,
   type PolarizedPassivePorts,
 } from "lib/utils/constants"
+import { symbols } from "schematic-symbols"
 import { NormalComponent } from "../base-components/NormalComponent/NormalComponent"
 import { Trace } from "../primitive-components/Trace/Trace"
 import { Capacitor_getAutomaticMaxDecouplingTraceLength } from "./Capacitor_getAutomaticMaxDecouplingTraceLength"
-import { formatSiUnit } from "format-si-unit"
+
+const CAPACITOR_CHIP_FOOTPRINTS = new Set([
+  "01005",
+  "0201",
+  "0402",
+  "0603",
+  "0805",
+  "1206",
+  "1210",
+  "2010",
+  "2512",
+])
 
 export class Capacitor extends NormalComponent<
   typeof capacitorProps,
@@ -16,11 +29,25 @@ export class Capacitor extends NormalComponent<
 > {
   _adjustSilkscreenTextAutomatically = true
   get config() {
+    const baseSymbolName = this.props.symbolName ?? "capacitor"
+    const compactSize =
+      this.props.schSize === "sm" || this.props.schSize === "xs"
+        ? this.props.schSize
+        : undefined
+    const compactSymbolName =
+      compactSize && baseSymbolName === "capacitor"
+        ? (`capacitor_${compactSize}` as BaseSymbolName)
+        : undefined
+    const schematicSymbolName =
+      compactSymbolName && `${compactSymbolName}_right` in symbols
+        ? compactSymbolName
+        : (baseSymbolName as BaseSymbolName)
+
     return {
       componentName: "Capacitor",
       schematicSymbolName: this.props.polarized
         ? "capacitor_polarized"
-        : (this.props.symbolName ?? ("capacitor" as BaseSymbolName)),
+        : schematicSymbolName,
       zodProps: capacitorProps,
       sourceFtype: FTYPE.simple_capacitor,
     }
@@ -64,6 +91,14 @@ export class Capacitor extends NormalComponent<
       return `${capacitanceDisplay}/${formatSiUnit(this._parsedProps.maxVoltageRating)}V`
     }
     return capacitanceDisplay
+  }
+
+  getFootprinterString(): string | null {
+    const baseFootprint = super.getFootprinterString()
+    if (baseFootprint && CAPACITOR_CHIP_FOOTPRINTS.has(baseFootprint)) {
+      return `cap${baseFootprint}`
+    }
+    return baseFootprint
   }
 
   doInitialCreateNetsFromProps() {

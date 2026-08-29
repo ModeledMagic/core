@@ -1,6 +1,6 @@
 import { type Bounds, doBoundsOverlap } from "@tscircuit/math-utils"
 import { SchematicTracePipelineSolver } from "@tscircuit/schematic-trace-solver"
-import type { SchematicNetLabel, SourceNet } from "circuit-json"
+import type { SchematicNetLabel, SourceNet, SourceTrace } from "circuit-json"
 import Debug from "debug"
 import { computeSchematicNetLabelCenter } from "lib/utils/schematic/computeSchematicNetLabelCenter"
 import type { NetLabel } from "../../NetLabel"
@@ -12,6 +12,7 @@ import { oppositeSide } from "./oppositeSide"
 import { type SchematicPortId, asSchematicPortId } from "./port-id-types"
 
 const debug = Debug("Group_doInitialSchematicTraceRender")
+type SourceTraceId = SourceTrace["source_trace_id"]
 
 interface UserDefinedNetLabel {
   schematicNetLabel: SchematicNetLabel
@@ -58,6 +59,14 @@ export function applyNetLabelPlacements(args: {
   group: Group<any>
   solver: SchematicTracePipelineSolver
   userNetIdToConnKey: Map<string, string>
+  crossSubcircuitTraceLabelBySchematicPortId: Map<
+    SchematicPortId,
+    { text: string; sourceTraceId: SourceTraceId }
+  >
+  sourceTraceIdByPortOnlyLabelSchematicPortId: Map<
+    SchematicPortId,
+    SourceTraceId
+  >
   connKeyToSourceNet: Map<string, SourceNet>
   connKeysWithExplicitPortNetTraces: Set<string>
   schematicPortIdsWithPreExistingNetLabels: Set<SchematicPortId>
@@ -69,6 +78,8 @@ export function applyNetLabelPlacements(args: {
     solver,
     connKeyToSourceNet,
     userNetIdToConnKey,
+    crossSubcircuitTraceLabelBySchematicPortId,
+    sourceTraceIdByPortOnlyLabelSchematicPortId,
     connKeysWithExplicitPortNetTraces,
     schematicPortIdsWithPreExistingNetLabels,
     schematicPortIdsWithRoutedTraces,
@@ -79,7 +90,10 @@ export function applyNetLabelPlacements(args: {
     createCanonicalSchematicNetLabelTextResolver(group)
 
   // Place net labels suggested by the solver
+  // The inline solver runs last and removes the anchored placement for any net
+  // it labeled inline, so a net is never labeled both ways.
   const netLabelPlacements =
+    solver.inlineNetLabelSolver?.getOutput().netLabelPlacements ??
     solver.netLabelNetLabelCollisionSolver?.getOutput().netLabelPlacements ??
     solver.netLabelTraceCollisionSolver?.getOutput().netLabelPlacements ??
     solver.netLabelPlacementSolver?.netLabelPlacements ??
@@ -143,10 +157,28 @@ export function applyNetLabelPlacements(args: {
   for (const placement of dedupedNetLabelPlacements) {
     debug(`processing placement: ${placement.netId}`)
 
+    const schPortIds = placement.pinIds.map(asSchematicPortId)
+    // Port-only placements have no solver pair id. A boundary label is owned
+    // by its exact crossing source trace; otherwise the input builder supplies
+    // an owner only when exactly one in-scope source trace touches that port.
+    const crossSubcircuitTraceLabel =
+      schPortIds.length === 1
+        ? crossSubcircuitTraceLabelBySchematicPortId.get(schPortIds[0]!)
+        : undefined
+    const placementSourceTraceId =
+      crossSubcircuitTraceLabel?.sourceTraceId ??
+      (schPortIds.length === 1
+        ? sourceTraceIdByPortOnlyLabelSchematicPortId.get(schPortIds[0]!)
+        : undefined)
+    const placementSourceTrace = placementSourceTraceId
+      ? db.source_trace.get(placementSourceTraceId)
+      : undefined
     const placementUserNetId = globalConnMap
       .getIdsConnectedToNet(placement.globalConnNetId)
       .find((id) => userNetIdToConnKey.get(id))
-    const placementConnKey = userNetIdToConnKey.get(placementUserNetId!)
+    const placementConnKey =
+      placementSourceTrace?.subcircuit_connectivity_map_key ??
+      userNetIdToConnKey.get(placementUserNetId!)
 
     const orientation = placement.orientation as AxisDirection
     const anchor_side = oppositeSide(orientation)
@@ -156,15 +188,19 @@ export function applyNetLabelPlacements(args: {
       sourceNet = connKeyToSourceNet.get(placementConnKey)
     }
     const canonicalNetLabel = placementConnKey
-      ? resolveCanonicalNetLabelText({
-          subcircuitConnectivityMapKey: placementConnKey,
-        })
+      ? crossSubcircuitTraceLabel
+        ? {
+            name: crossSubcircuitTraceLabel.text,
+            wasAssignedDisplayLabel: false,
+          }
+        : resolveCanonicalNetLabelText({
+            subcircuitConnectivityMapKey: placementConnKey,
+          })
       : {
           name: placement.netId ?? placement.globalConnNetId,
           wasAssignedDisplayLabel: false,
         }
 
-    const schPortIds = placement.pinIds.map(asSchematicPortId)
     // Solver labels belong to the same sheet as their connected port.
     let schematicSheetId = group._resolveSchematicSheetId()
     const schematicPort = db.schematic_port.get(schPortIds[0])
@@ -192,7 +228,6 @@ export function applyNetLabelPlacements(args: {
         anchor_position = anchorSchPort.center
       }
     }
-
     if (
       schPortIds.some((schPortId) =>
         schematicPortIdsWithPreExistingNetLabels.has(schPortId),
@@ -250,6 +285,7 @@ export function applyNetLabelPlacements(args: {
             center,
             anchor_side,
             schematic_sheet_id: schematicSheetId,
+            source_trace_id: placementSourceTraceId,
           },
         )
         continue
@@ -278,6 +314,7 @@ export function applyNetLabelPlacements(args: {
         center,
         anchor_side,
         schematic_sheet_id: schematicSheetId,
+        source_trace_id: placementSourceTraceId,
       }
       db.schematic_net_label.insert(netLabel)
       continue
@@ -318,6 +355,7 @@ export function applyNetLabelPlacements(args: {
       center,
       anchor_side,
       schematic_sheet_id: schematicSheetId,
+      source_trace_id: placementSourceTraceId,
     }
     db.schematic_net_label.insert(netLabel)
   }

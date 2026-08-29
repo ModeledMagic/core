@@ -62,7 +62,7 @@ test("generates an FDM enclosure and USB-C aperture with the enclosure solver", 
           />
         </connector>
       </board>
-      <enclosure.fdm.box boardRef=".main-board" />
+      <enclosure.fdm.box boardRef=".main-board" showHiddenEdges />
     </group>,
   )
 
@@ -76,22 +76,29 @@ test("generates an FDM enclosure and USB-C aperture with the enclosure solver", 
   })
   expect(enclosureSolverEvent?.solverParams.apertures[0]).toMatchObject({
     shape: "pill",
-    wall: "front",
-    offset: 0,
+    face: "y_pos",
+    center: { x: 0 },
   })
-  expect(enclosureSolverEvent?.solverParams.apertures[0].centerZ).toBeCloseTo(
-    5.7,
-  )
   expect(enclosureSolverEvent?.solverConstructorArgs).toEqual([
     enclosureSolverEvent?.solverParams,
   ])
-  const enclosureCadComponent = circuit.db.cad_component
+  const enclosureCadComponents = circuit.db.cad_component
     .list()
-    .find((cadComponent) => cadComponent.model_jscad)
-  expect(enclosureCadComponent?.show_as_translucent_model).toBe(false)
+    .filter((cadComponent) => cadComponent.model_jscad)
+  // Base and lid are independently renderable CAD meshes, sharing the existing
+  // synthetic PCB owner until the typed schema adds durable part roles.
+  expect(enclosureCadComponents).toHaveLength(2)
+  expect(
+    new Set(enclosureCadComponents.map((cad) => cad.cad_component_id)).size,
+  ).toBe(2)
+  for (const cad of enclosureCadComponents) {
+    expect(cad.show_as_translucent_model).toBe(false)
+    expect(cad.show_hidden_edges).toBe(true)
+  }
 
   await expect(circuit).toMatchSimple3dSnapshot(import.meta.path, {
     camPos: [30, 24, 50],
+    diffTolerance: 0,
     poppygl: {
       lookAt: [0, 0, 3.5],
       backgroundColor: [1, 1, 1],
